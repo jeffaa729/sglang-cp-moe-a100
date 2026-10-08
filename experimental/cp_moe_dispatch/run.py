@@ -64,7 +64,7 @@ def main():
                     "--host", "127.0.0.1", "--port", "30000", "--model", args.model,
                     "--dataset-name", "random-ids", "--tokenize-prompt",
                     "--random-input-len", str(length), "--random-output-len", "1" if args.validate else "32",
-                    "--random-range-ratio", "0", "--num-prompts", "1" if args.validate else str(args.repetitions),
+                    "--random-range-ratio", "1", "--num-prompts", "1" if args.validate else str(args.repetitions),
                     "--max-concurrency", "1", "--warmup-requests", "0" if args.validate else "2",
                     "--seed", str(args.seed), "--temperature", "0", "--cache-report",
                     "--output-details", "--output-file", str(output), "--disable-tqdm",

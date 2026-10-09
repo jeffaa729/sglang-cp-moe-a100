@@ -10,9 +10,10 @@ measured host; each new shape is bitwise-calibrated on random BF16 values.
 Unsupported/nonmatching layouts fall back to native AR and log that decision.
 Four-GPU 16K strict model checks pass (192/192), with 8/8 fixed-admission C1/C2
 responses and all 256 generated-token log probabilities exactly matching native.
-Eight-GPU strict checks pass (384/384); output validation is still being checked.
-No serving speedup is claimed for this candidate yet. Logged ring send bytes are
-analytical payload estimates, not measured PCIe traffic or elapsed time.
+Eight-GPU strict checks also pass (384/384), with 8/8 fixed-admission C1/C2
+responses and all 256 generated-token log probabilities exactly matching native.
+Matched native serving results are retained outside the repository. Logged ring
+send bytes are analytical payload estimates, not measured PCIe traffic or elapsed time.
 
 Ordinary rs status (2026-10-09): owner-collective tests pass at 2/4/8 ranks;
 the generalized two-GPU model passes strict checks. Four-GPU 16K validation
@@ -21,7 +22,7 @@ Eight-GPU full-model validation and 4/8-GPU performance are not established.
 The separate four-GPU numerical layer check passes, but the initial real-document
 output check matches only 1/4 C1 and 0/4 C2 responses. Native C1 repeats 4/4
 exactly; native C2 repeats 3/4, so scheduling also needs control at concurrency.
-Ring-only strict validation still fails. No 4/8-GPU performance is accepted.
+Ring-only strict validation still fails. No ordinary-rs 4/8-GPU performance is accepted.
 Strict remains the default. A separately authorized numerical-validation track
 is available; its results do not establish end-to-end correctness by themselves.
 Do not treat configuration acceptance as full-model support or run performance
@@ -72,7 +73,7 @@ Add --model-shape to include the actual 16K x 2048 message size: small collectiv
 alone do not expose the model-sized BF16 all-reduce/reduce-scatter discrepancy.
 Use --variant rs_striped for the compatible candidate: it additionally requires
 bitwise native-AR equality, active optimization at the model shape, and correct
-fallback when the measured stripe hint is deliberately mismatched.
+all-rank fallback when a candidate parity fault is deliberately injected on rank 0.
 Integer cases require exact results; random BF16 cases predeclare relative L2
 <= 1% versus an FP32 sum. Native BF16 all-reduce differences are also recorded.
 Default model --validate requires exact output/routing parity; collective

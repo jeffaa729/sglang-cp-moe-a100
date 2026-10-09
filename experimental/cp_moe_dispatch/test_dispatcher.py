@@ -80,7 +80,15 @@ def check_reduce_scatter(rank, world_size, device, model_shape=False, striped=Fa
                     assert reducer.active[(shape, partial.dtype, partial.device)]
                     if not integer:
                         rejected = StripedOwnerReduce(reducer.group)
-                        rejected.block_bytes = 1024 * 1024
+                        # A different stripe need not change two-rank BF16 sums.
+                        # A rank-0 parity fault must reject the path on EVERY rank.
+                        striped_impl = rejected._striped
+
+                        def faulty_striped(value, layout):
+                            result = striped_impl(value, layout)
+                            return result + 1 if rank == 0 else result
+
+                        rejected._striped = faulty_striped
                         fallback = rejected(partial)[:rows[rank]].float().cpu()
                         assert not rejected.active[(shape, partial.dtype, partial.device)]
                         assert torch.equal(fallback, baseline)

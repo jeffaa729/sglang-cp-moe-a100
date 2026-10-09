@@ -8,8 +8,14 @@ Validation status (2026-10-09): owner-collective tests pass at 2/4/8 ranks;
 the generalized two-GPU model passes strict checks. Four-GPU 16K validation
 fails bitwise equality at layer 0 despite exact routing (relative L2 0.233-0.264%).
 Eight-GPU full-model validation and 4/8-GPU performance are not established.
-The strict gate remains unchanged; do not treat configuration acceptance as
-full-model support or run performance acceptance ahead of correctness.
+The separate four-GPU numerical layer check passes, but the initial real-document
+output check matches only 1/4 C1 and 0/4 C2 responses. Native C1 repeats 4/4
+exactly; native C2 repeats 3/4, so scheduling also needs control at concurrency.
+Ring-only strict validation still fails. No 4/8-GPU performance is accepted.
+Strict remains the default. A separately authorized numerical-validation track
+is available; its results do not establish end-to-end correctness by themselves.
+Do not treat configuration acceptance as full-model support or run performance
+acceptance ahead of correctness.
 
 From the repository root, with dependencies installed and its Python package active:
   python experimental/cp_moe_dispatch/run.py baseline
@@ -38,6 +44,12 @@ profile label); never include profiled timings in performance aggregates.
 Untimed model-layer correctness checks (exclude these results from timing):
   python experimental/cp_moe_dispatch/run.py rs --validate
   python experimental/cp_moe_dispatch/run.py direct_fast --validate
+  python experimental/cp_moe_dispatch/run.py rs --parallel-size 4 --validate --validation-mode numerical --lengths 16384
+Numerical mode preserves the predeclared 1% relative-L2 bound, requires exact
+routing slots and same-partial native all-reduce/reference agreement, and checks
+both native and candidate output against an FP32 sum. Bitwise differences remain
+reported. It is validation-only; output/log-probability comparisons are a separate
+end-to-end gate before performance acceptance.
 
 Two-GPU dispatcher oracle (unequal/empty shards and destination routing):
   cd experimental/cp_moe_dispatch
@@ -45,9 +57,11 @@ Two-GPU dispatcher oracle (unequal/empty shards and destination routing):
 
 Owner reduce-scatter padding/FP32 oracle (set nproc to 2, 4, or 8):
   python -m torch.distributed.run --standalone --nproc-per-node=8 test_dispatcher.py --variant rs --output-dir /workspace/cp_moe_8gpu/unit_rs_n8
+Add --model-shape to include the actual 16K x 2048 message size: small collectives
+alone do not expose the model-sized BF16 all-reduce/reduce-scatter discrepancy.
 Integer cases require exact results; random BF16 cases predeclare relative L2
 <= 1% versus an FP32 sum. Native BF16 all-reduce differences are also recorded.
-Real model --validate still requires exact output/routing parity; collective
+Default model --validate requires exact output/routing parity; collective
 tests alone do not establish full-model or serving correctness.
 
 Reports and measured results are not committed. NVFP4 timings are not A100 claims.

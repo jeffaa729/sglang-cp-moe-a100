@@ -19,7 +19,13 @@ def install():
     from sglang.srt.runtime_context import get_parallel
     mode = os.environ["CP_MOE_VARIANT"]
     is_direct = mode in ("direct", "direct_fast")
-    validate = os.environ.get("CP_MOE_VALIDATE") == "1"
+    validation_mode = os.environ.get("CP_MOE_VALIDATE", "0")
+    if validation_mode not in ("0", "1", "numerical"):
+        raise ValueError(f"Unknown CP validation mode: {validation_mode}")
+    validate = validation_mode != "0"
+    numerical = validation_mode == "numerical"
+    if numerical and mode != "rs":
+        raise ValueError("Numerical validation is only implemented for reduce-scatter")
     original_gather = ops.moe_cp_gather
     original_take = ops.moe_cp_take_back
     original_forward = model.Qwen3MoeSparseMoeBlock.forward_normal
@@ -62,11 +68,13 @@ def install():
         do_check = validate and key not in seen
         ref = None
         reference_ids = None
+        reference_weights = None
         if do_check:
             full = original_gather(state["local"], rows, len(rows))
             reference_logits, _ = block.gate(full)
             reference_topk = block.topk(full, reference_logits)
             reference_ids = original_take(reference_topk.topk_ids, rows).clone()
+            reference_weights = original_take(reference_topk.topk_weights, rows).clone()
             ref = original_take(original_forward(block, full), rows).clone()
         if is_direct:
             # Preserve baseline GEMM/top-k geometry, including owner row offset.
@@ -83,6 +91,7 @@ def install():
             topk = block.topk(x, logits)
         assert isinstance(topk, StandardTopKOutput), type(topk)
         stats = None
+        oracle_checks = None
         if is_direct:
             def experts(hidden, ids, weights):
                 return block.experts(hidden, StandardTopKOutput(weights, ids, None))
@@ -97,6 +106,16 @@ def install():
             local = partial.new_empty((padded_rows, partial.shape[1]))
             p.moe_ep_group.reduce_scatter_tensor(local, partial)
             out = local[:rows[rank]].contiguous()
+            if do_check and numerical:
+                # Untimed: isolate the collective using the SAME expert partials.
+                native = original_take(p.moe_ep_group.all_reduce(partial.clone()), rows)
+                oracle = original_take(p.moe_ep_group.all_reduce(partial.float()), rows)
+                scale = oracle.norm().clamp_min(1e-12)
+                oracle_checks = dict(
+                    same_partial_ar_exact=torch.equal(native, ref),
+                    finite=bool(torch.isfinite(oracle).all() and torch.isfinite(ref).all()),
+                    baseline_relative_l2=((ref.float()-oracle).norm()/scale).item(),
+                    candidate_relative_l2=((out.float()-oracle).norm()/scale).item())
         else:
             raise ValueError(mode)
         state["complete"] = True
@@ -105,10 +124,15 @@ def install():
             difference = (out.float() - ref.float()).abs()
             scale = ref.float().norm().clamp_min(1e-12)
             record = dict(variant=mode, layer=block.layer_id, rank=rank, rows=rows,
+                          validation_mode="numerical" if numerical else "strict",
                           exact=torch.equal(out, ref), max_abs=difference.max().item(),
                           relative_l2=(difference.norm()/scale).item(),
                           finite=bool(torch.isfinite(out).all()), traffic=stats)
+            if oracle_checks is not None:
+                record["fp32_oracle"] = oracle_checks
             checked_ids = topk.topk_ids if is_direct else original_take(topk.topk_ids, rows)
+            checked_weights = topk.topk_weights if is_direct else original_take(topk.topk_weights, rows)
+            record["routing_weights_exact"] = torch.equal(checked_weights, reference_weights)
             record["routing_slot_mismatches"] = int((checked_ids != reference_ids).sum().item())
             record["routing_expert_set_mismatches"] = int((checked_ids.sort(-1).values
                                                           != reference_ids.sort(-1).values).sum().item())
@@ -116,7 +140,14 @@ def install():
             # Strict model gate: numerical bound plus exact native output/routing.
             assert record["finite"] and record["relative_l2"] <= 0.01, record
             assert record["routing_expert_set_mismatches"] == 0, record
-            assert record["exact"], record
+            if numerical:
+                assert record["routing_slot_mismatches"] == 0, record
+                assert record["routing_weights_exact"], record
+                assert oracle_checks["same_partial_ar_exact"] and oracle_checks["finite"], record
+                assert oracle_checks["baseline_relative_l2"] <= 0.01, record
+                assert oracle_checks["candidate_relative_l2"] <= 0.01, record
+            else:
+                assert record["exact"], record
         return out
 
     ops.moe_cp_gather = gather

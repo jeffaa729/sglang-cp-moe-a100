@@ -32,6 +32,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("variant", choices=["baseline", "rs", "direct", "direct_fast"])
     parser.add_argument("--validate", action="store_true", help="Untimed layerwise reference checks")
+    parser.add_argument("--validation-mode", choices=["strict", "numerical"], default="strict",
+                        help="Strict requires bitwise parity; numerical adds same-partial FP32 checks")
     parser.add_argument("--profile", action="store_true", help="Separate native Torch profile; not a timed result")
     parser.add_argument("--lengths", nargs="+", type=int, default=[2048, 8192, 16384])
     parser.add_argument("--repetitions", type=int, default=10)
@@ -51,6 +53,8 @@ def main():
     args = parser.parse_args()
     if args.validate and args.profile:
         parser.error("Run reference validation separately from profiling")
+    if args.validation_mode == "numerical" and (not args.validate or args.variant != "rs"):
+        parser.error("Numerical mode requires rs --validate; it is never a timed benchmark")
     if args.variant in ("direct", "direct_fast") and args.parallel_size != 2:
         parser.error("Direct dispatch still requires --parallel-size 2")
     if min(args.concurrencies + [args.max_running_requests, args.max_total_tokens,
@@ -75,7 +79,8 @@ def main():
     env = dict(os.environ)
     env.update(PYTHONPATH=os.pathsep.join(map(str, [ROOT / "extension", ROOT, REPO / "python"])),
                HF_HUB_OFFLINE="1", CP_MOE_VARIANT=args.variant,
-               CP_MOE_VALIDATE="1" if args.validate else "0")
+               CP_MOE_VALIDATE=("numerical" if args.validation_mode == "numerical" else "1")
+               if args.validate else "0")
     server_args = list(SERVER_ARGS)
     for flag, value in [("--tp-size", args.parallel_size), ("--ep-size", args.parallel_size),
                         ("--attn-cp-size", args.parallel_size),

@@ -19,7 +19,7 @@ def expert_partial(x, ids, weights, rank):
     return result.to(x.dtype)
 
 
-def check_reduce_scatter(rank, world_size, device):
+def check_reduce_scatter(rank, world_size, device, model_shape=False):
     """Check rank-major ownership, padding, empty owners and BF16 sum error.
 
     Integer cases require exact ownership/results. Random BF16 cases use a
@@ -31,9 +31,12 @@ def check_reduce_scatter(rank, world_size, device):
                  (0,) + (11,) * (world_size - 1),
                  (13,) + (0,) * (world_size - 1),
                  (0,) * world_size]
+    cases = [(rows, 32) for rows in row_cases]
+    if model_shape:
+        cases.append(((16384 // world_size,) * world_size, 2048))
     results = []
-    for rows in row_cases:
-        shape = (max(rows) * world_size, 32)
+    for rows, width in cases:
+        shape = (max(rows) * world_size, width)
         for integer in (True, False):
             gen = torch.Generator().manual_seed(712)
             partials = []
@@ -60,7 +63,7 @@ def check_reduce_scatter(rank, world_size, device):
                 rows, rank, integer, relative_l2)
             if integer:
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
-            results.append(dict(rows=rows, rank=rank, integer=integer,
+            results.append(dict(rows=rows, width=width, rank=rank, integer=integer,
                 relative_l2=relative_l2, exact_allreduce=torch.equal(actual, baseline),
                 max_abs_vs_fp32=difference.abs().max().item() if actual.numel() else 0,
                 max_abs_vs_allreduce=(actual - baseline).abs().max().item()
@@ -72,14 +75,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output-dir', type=Path)
     parser.add_argument('--variant', choices=['direct', 'rs'], default='direct')
+    parser.add_argument('--model-shape', action='store_true',
+                        help='Also test the 64 MiB BF16 16K x 2048 collective')
     args = parser.parse_args()
+    if args.model_shape and args.variant != 'rs':
+        parser.error('--model-shape requires --variant rs')
     rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
     dist.init_process_group('nccl', device_id=torch.device(f'cuda:{rank}'))
     device = torch.device(f'cuda:{rank}')
     world_size = dist.get_world_size()
     if args.variant == 'rs':
-        results = check_reduce_scatter(rank, world_size, device)
+        results = check_reduce_scatter(rank, world_size, device, args.model_shape)
         if args.output_dir is not None:
             args.output_dir.mkdir(parents=True, exist_ok=True)
             (args.output_dir/f'rs_rank{rank}.json').write_text(json.dumps(results, indent=2))

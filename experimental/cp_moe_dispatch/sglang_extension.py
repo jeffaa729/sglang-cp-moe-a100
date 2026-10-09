@@ -10,6 +10,7 @@ import json
 import os
 import torch
 from dispatcher import direct_dispatch
+from owner_reduce import StripedOwnerReduce
 
 
 def install():
@@ -31,6 +32,7 @@ def install():
     original_forward = model.Qwen3MoeSparseMoeBlock.forward_normal
     state = {}
     seen = set()
+    owner_reduce = None
 
     def gather(x, rows, size):
         p = get_parallel()
@@ -59,6 +61,7 @@ def install():
         return original_take(x, rows)
 
     def forward(block, x):
+        nonlocal owner_reduce
         if not state:
             return original_forward(block, x)
         p = get_parallel()
@@ -99,12 +102,17 @@ def install():
                                          experts, rank, p.moe_ep_group.device_group,
                                          collect_stats=do_check,
                                          keep_local_rows=mode == "direct_fast")
-        elif mode == "rs":
+        elif mode in ("rs", "rs_striped"):
             partial = block.experts(x, topk)
             # Same reduction as all-reduce + slice, but never replicates the sum.
             padded_rows = max(rows)
-            local = partial.new_empty((padded_rows, partial.shape[1]))
-            p.moe_ep_group.reduce_scatter_tensor(local, partial)
+            if mode == "rs_striped":
+                if owner_reduce is None:
+                    owner_reduce = StripedOwnerReduce(p.moe_ep_group)
+                local = owner_reduce(partial)
+            else:
+                local = partial.new_empty((padded_rows, partial.shape[1]))
+                p.moe_ep_group.reduce_scatter_tensor(local, partial)
             out = local[:rows[rank]].contiguous()
             if do_check and numerical:
                 # Untimed: isolate the collective using the SAME expert partials.

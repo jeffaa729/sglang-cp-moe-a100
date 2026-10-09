@@ -5,7 +5,9 @@ import os
 from pathlib import Path
 import torch
 import torch.distributed as dist
+from types import SimpleNamespace
 from dispatcher import direct_dispatch
+from owner_reduce import StripedOwnerReduce
 
 
 def expert_partial(x, ids, weights, rank):
@@ -19,7 +21,7 @@ def expert_partial(x, ids, weights, rank):
     return result.to(x.dtype)
 
 
-def check_reduce_scatter(rank, world_size, device, model_shape=False):
+def check_reduce_scatter(rank, world_size, device, model_shape=False, striped=False):
     """Check rank-major ownership, padding, empty owners and BF16 sum error.
 
     Integer cases require exact ownership/results. Random BF16 cases use a
@@ -35,6 +37,12 @@ def check_reduce_scatter(rank, world_size, device, model_shape=False):
     if model_shape:
         cases.append(((16384 // world_size,) * world_size, 2048))
     results = []
+    def all_reduce(x):
+        dist.all_reduce(x)
+        return x
+    reducer = StripedOwnerReduce(SimpleNamespace(rank_in_group=rank, world_size=world_size,
+        device_group=dist.group.WORLD, all_reduce=all_reduce,
+        reduce_scatter_tensor=dist.reduce_scatter_tensor)) if striped else None
     for rows, width in cases:
         shape = (max(rows) * world_size, width)
         for integer in (True, False):
@@ -51,8 +59,11 @@ def check_reduce_scatter(rank, world_size, device, model_shape=False):
             partial = partials[rank].to(device)
             summed = partial.clone()
             dist.all_reduce(summed)
-            local = partial.new_empty((max(rows), shape[1]))
-            dist.reduce_scatter_tensor(local, partial)
+            if reducer is None:
+                local = partial.new_empty((max(rows), shape[1]))
+                dist.reduce_scatter_tensor(local, partial)
+            else:
+                local = reducer(partial)
             actual = local[:rows[rank]].float().cpu()
             offset = rank * max(rows)
             expected = torch.stack(partials).float().sum(0)[offset:offset + rows[rank]]
@@ -63,6 +74,16 @@ def check_reduce_scatter(rank, world_size, device, model_shape=False):
                 rows, rank, integer, relative_l2)
             if integer:
                 torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            if striped:
+                assert torch.equal(actual, baseline), (rows, rank, integer)
+                if shape == (16384, 2048):
+                    assert reducer.active[(shape, partial.dtype, partial.device)]
+                    if not integer:
+                        rejected = StripedOwnerReduce(reducer.group)
+                        rejected.block_bytes = 1024 * 1024
+                        fallback = rejected(partial)[:rows[rank]].float().cpu()
+                        assert not rejected.active[(shape, partial.dtype, partial.device)]
+                        assert torch.equal(fallback, baseline)
             results.append(dict(rows=rows, width=width, rank=rank, integer=integer,
                 relative_l2=relative_l2, exact_allreduce=torch.equal(actual, baseline),
                 max_abs_vs_fp32=difference.abs().max().item() if actual.numel() else 0,
@@ -74,19 +95,20 @@ def check_reduce_scatter(rank, world_size, device, model_shape=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output-dir', type=Path)
-    parser.add_argument('--variant', choices=['direct', 'rs'], default='direct')
+    parser.add_argument('--variant', choices=['direct', 'rs', 'rs_striped'], default='direct')
     parser.add_argument('--model-shape', action='store_true',
                         help='Also test the 64 MiB BF16 16K x 2048 collective')
     args = parser.parse_args()
-    if args.model_shape and args.variant != 'rs':
-        parser.error('--model-shape requires --variant rs')
+    if args.model_shape and args.variant == 'direct':
+        parser.error('--model-shape requires a reduce-scatter variant')
     rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
     dist.init_process_group('nccl', device_id=torch.device(f'cuda:{rank}'))
     device = torch.device(f'cuda:{rank}')
     world_size = dist.get_world_size()
-    if args.variant == 'rs':
-        results = check_reduce_scatter(rank, world_size, device, args.model_shape)
+    if args.variant in ('rs', 'rs_striped'):
+        results = check_reduce_scatter(rank, world_size, device, args.model_shape,
+                                       args.variant == 'rs_striped')
         if args.output_dir is not None:
             args.output_dir.mkdir(parents=True, exist_ok=True)
             (args.output_dir/f'rs_rank{rank}.json').write_text(json.dumps(results, indent=2))

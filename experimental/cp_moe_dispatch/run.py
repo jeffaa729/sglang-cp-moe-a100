@@ -30,7 +30,7 @@ SERVER_ARGS = [
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("variant", choices=["baseline", "rs", "direct", "direct_fast"])
+    parser.add_argument("variant", choices=["baseline", "rs", "rs_striped", "direct", "direct_fast"])
     parser.add_argument("--validate", action="store_true", help="Untimed layerwise reference checks")
     parser.add_argument("--validation-mode", choices=["strict", "numerical"], default="strict",
                         help="Strict requires bitwise parity; numerical adds same-partial FP32 checks")

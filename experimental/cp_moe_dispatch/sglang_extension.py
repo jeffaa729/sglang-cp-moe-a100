@@ -1,6 +1,8 @@
 """Pinned Qwen3 eager-prefill extension: direct dispatch or AG + RS.
 
-Restricted to TP=CP=EP=2, attention DP=1, MoE TP=1, zigzag, CUTLASS,
+RS experiments accept aligned TP=CP=EP in (2, 4, 8); direct remains two-rank.
+Accepting a configuration does not establish model correctness on that size.
+Restricted to attention DP=1, MoE TP=1, zigzag, CUTLASS,
 standard top-k, no shared experts, no overlap or CUDA graphs. Decode falls back.
 All configuration is contained in run.py rather than persistent environment.
 """
@@ -26,10 +28,15 @@ def install():
 
     def gather(x, rows, size):
         p = get_parallel()
+        assert size in (2, 4, 8), size
         assert (p.tp_size, p.attn_cp_size, p.moe_ep_size, p.moe_tp_size,
-                p.attn_dp_size) == (2, 2, 2, 1, 1)
+                p.attn_dp_size) == (size, size, size, 1, 1)
         assert p.attn_cp_rank == p.moe_ep_rank
-        assert size == 2 and not state
+        assert p.attn_cp_group.ranks == p.moe_ep_group.ranks
+        assert len(rows) == size and x.shape[0] == rows[p.attn_cp_rank]
+        assert not state, "Overlapping CP batches are not supported"
+        if is_direct and size != 2:
+            raise ValueError("Direct dispatch is not generalized beyond CP=EP=2")
         # Dynamic packing overhead is not worthwhile for tiny prefill batches.
         # Preserve the unmodified path for warmup, health checks and short chats.
         if is_direct and max(rows) < 128:
@@ -56,7 +63,7 @@ def install():
         ref = None
         reference_ids = None
         if do_check:
-            full = original_gather(state["local"], rows, 2)
+            full = original_gather(state["local"], rows, len(rows))
             reference_logits, _ = block.gate(full)
             reference_topk = block.topk(full, reference_logits)
             reference_ids = original_take(reference_topk.topk_ids, rows).clone()
@@ -65,7 +72,7 @@ def install():
             # Preserve baseline GEMM/top-k geometry, including owner row offset.
             # Only local REAL activations are present; other rows are zeros.
             # This avoids BF16 router tactic changes caused by a smaller M.
-            gate_input = x.new_zeros((max(rows)*2, x.shape[1]))
+            gate_input = x.new_zeros((max(rows)*len(rows), x.shape[1]))
             gate_input[rank*max(rows):rank*max(rows) + x.shape[0]].copy_(x)
             logits, _ = block.gate(gate_input)
             padded_topk = block.topk(gate_input, logits)
@@ -106,7 +113,7 @@ def install():
             record["routing_expert_set_mismatches"] = int((checked_ids.sort(-1).values
                                                           != reference_ids.sort(-1).values).sum().item())
             print("CP_DISPATCH_CHECK " + json.dumps(record), flush=True)
-            # Predeclared BF16 equivalence gate; exactness reported separately.
+            # Strict model gate: numerical bound plus exact native output/routing.
             assert record["finite"] and record["relative_l2"] <= 0.01, record
             assert record["routing_expert_set_mismatches"] == 0, record
             assert record["exact"], record

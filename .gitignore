@@ -283,3 +283,5 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+/python/sglang/multimodal_gen
+python/sglang/multimodal_gen/.claude/skills

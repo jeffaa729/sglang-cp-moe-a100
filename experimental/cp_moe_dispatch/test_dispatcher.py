@@ -1,4 +1,4 @@
-"""CPU oracle plus real two-GPU NCCL checks for dispatcher contracts."""
+"""CPU oracle/NCCL checks: direct CP2 or padded owner reduce-scatter CP2/4/8."""
 import argparse
 import json
 import os
@@ -19,14 +19,75 @@ def expert_partial(x, ids, weights, rank):
     return result.to(x.dtype)
 
 
+def check_reduce_scatter(rank, world_size, device):
+    """Check rank-major ownership, padding, empty owners and BF16 sum error.
+
+    Integer cases require exact ownership/results. Random BF16 cases use a
+    predeclared 1% relative-L2 gate against an FP32 sum of the same partials.
+    Also report differences versus native BF16 all-reduce without hiding them.
+    """
+    row_cases = [(9,) * world_size,
+                 tuple(7 + r for r in range(world_size)),
+                 (0,) + (11,) * (world_size - 1),
+                 (13,) + (0,) * (world_size - 1),
+                 (0,) * world_size]
+    results = []
+    for rows in row_cases:
+        shape = (max(rows) * world_size, 32)
+        for integer in (True, False):
+            gen = torch.Generator().manual_seed(712)
+            partials = []
+            for source in range(world_size):
+                if integer:
+                    x = (torch.arange(shape[0])[:, None] % 7
+                         + torch.arange(shape[1])[None, :] % 4
+                         + source).to(torch.bfloat16)
+                else:
+                    x = torch.randn(shape, generator=gen).to(torch.bfloat16)
+                partials.append(x)
+            partial = partials[rank].to(device)
+            summed = partial.clone()
+            dist.all_reduce(summed)
+            local = partial.new_empty((max(rows), shape[1]))
+            dist.reduce_scatter_tensor(local, partial)
+            actual = local[:rows[rank]].float().cpu()
+            offset = rank * max(rows)
+            expected = torch.stack(partials).float().sum(0)[offset:offset + rows[rank]]
+            baseline = summed[offset:offset + rows[rank]].float().cpu()
+            difference = actual - expected
+            relative_l2 = (difference.norm() / expected.norm().clamp_min(1e-12)).item()
+            assert bool(torch.isfinite(actual).all()) and relative_l2 <= 0.01, (
+                rows, rank, integer, relative_l2)
+            if integer:
+                torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+            results.append(dict(rows=rows, rank=rank, integer=integer,
+                relative_l2=relative_l2, exact_allreduce=torch.equal(actual, baseline),
+                max_abs_vs_fp32=difference.abs().max().item() if actual.numel() else 0,
+                max_abs_vs_allreduce=(actual - baseline).abs().max().item()
+                if actual.numel() else 0))
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--variant', choices=['direct', 'rs'], default='direct')
     args = parser.parse_args()
     rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(rank)
     dist.init_process_group('nccl', device_id=torch.device(f'cuda:{rank}'))
     device = torch.device(f'cuda:{rank}')
+    world_size = dist.get_world_size()
+    if args.variant == 'rs':
+        results = check_reduce_scatter(rank, world_size, device)
+        if args.output_dir is not None:
+            args.output_dir.mkdir(parents=True, exist_ok=True)
+            (args.output_dir/f'rs_rank{rank}.json').write_text(json.dumps(results, indent=2))
+        print(f'rank={rank}: {len(results)} owner-RS/FP32-oracle cases passed', flush=True)
+        dist.destroy_process_group()
+        return
+    if world_size != 2:
+        raise ValueError('Direct dispatcher tests still require two ranks')
     gen = torch.Generator().manual_seed(712)
     results = []
     for rows in ((9, 7), (0, 11), (13, 0), (0, 0)):

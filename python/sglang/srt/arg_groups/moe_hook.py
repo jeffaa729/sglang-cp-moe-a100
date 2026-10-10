@@ -35,6 +35,87 @@ from sglang.srt.utils.common import is_sm100_supported, parse_connector_type
 logger = logging.getLogger(__name__)
 
 
+def validate_moe_cp_output_reduction(server_args: Any) -> None:
+    """Keep the opt-in CP-owner path within its validated execution contract."""
+    cfg = resolving_view(server_args)
+    mode = cfg.moe_cp_output_reduction
+    validation = cfg.moe_cp_output_validation
+    if mode == "all_reduce":
+        if validation != "none":
+            raise ValueError("CP output validation requires an owner-reduction mode")
+        return
+    if mode not in ("reduce_scatter", "striped_reduce_scatter"):
+        raise ValueError(f"Unknown MoE CP output reduction: {mode}")
+    if validation not in ("none", "strict", "numerical"):
+        raise ValueError(f"Unknown MoE CP output validation: {validation}")
+    if validation == "numerical" and mode != "reduce_scatter":
+        raise ValueError("Numerical CP output validation requires reduce_scatter")
+    requirements = (
+        (cfg.enable_prefill_cp and cfg.cp_strategy == "zigzag", "zigzag prefill CP"),
+        (
+            cfg.tp_size in (2, 4, 8) and cfg.tp_size == cfg.attn_cp_size == cfg.ep_size,
+            "aligned TP=CP=EP=2/4/8",
+        ),
+        (
+            cfg.attn_dp_size == cfg.moe_dp_size == cfg.dwdp_size == 1,
+            "attention DP=MoE DP=DWDP=1",
+        ),
+        (
+            cfg.nnodes == cfg.pp_size == 1,
+            "single-node execution without pipeline parallelism",
+        ),
+        (
+            cfg.device == "cuda" and cfg.dtype == "bfloat16",
+            "CUDA with BF16 activations",
+        ),
+        (
+            cfg.moe_a2a_backend == "none"
+            and cfg.moe_runner_backend == "flashinfer_cutlass",
+            "moe-a2a-backend=none and moe-runner-backend=flashinfer_cutlass",
+        ),
+        (
+            cfg.disable_flashinfer_cutlass_moe_fp4_allgather,
+            "native BF16 input all-gather",
+        ),
+        (
+            cfg.disable_overlap_schedule
+            and not cfg.enable_two_batch_overlap
+            and not cfg.enable_single_batch_overlap,
+            "execution without scheduler or batch overlap",
+        ),
+        (
+            (cfg.chunked_prefill_size or 0) <= 0 and cfg.disable_radix_cache,
+            "disabled chunked prefill and radix cache",
+        ),
+        (
+            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+            and cfg.cuda_graph_config.decode.backend == Backend.DISABLED,
+            "disabled CUDA graphs",
+        ),
+        (
+            cfg.disable_custom_all_reduce and not cfg.enable_quant_communications,
+            "native, unquantized NCCL collectives",
+        ),
+        (
+            not cfg.enable_lora and cfg.speculative_algorithm is None,
+            "execution without LoRA or speculative decoding",
+        ),
+        (
+            not cfg.enable_eplb and cfg.elastic_ep_backend is None,
+            "static expert placement without elastic EP",
+        ),
+        (not cfg.enable_fused_moe_sum_all_reduce, "unfused expert-output reduction"),
+    )
+    for supported, description in requirements:
+        if not supported:
+            raise ValueError(f"--moe-cp-output-reduction={mode} requires {description}")
+    architectures = model_config_of(server_args).hf_config.architectures or []
+    if architectures != ["Qwen3MoeForCausalLM"]:
+        raise ValueError(
+            "CP-owner output reduction is currently validated only for Qwen3MoeForCausalLM"
+        )
+
+
 def handle_moe_kernel_config(server_args: Any):
     # The quantization-driven runner resolutions moved to the pipeline
     # (arg_groups/overrides.py: _moe_runner_backend_quant_constraints);

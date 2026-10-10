@@ -14,6 +14,7 @@ import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
+    moe_hook,
     parallel_hook,
     pd_disaggregation_hook,
     serving_hook,
@@ -29,6 +30,7 @@ from sglang.srt.arg_groups.cuda_graph_hook import (
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
 )
+from sglang.srt.arg_groups.fields.exec_ import ExecMoe
 from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
@@ -4083,6 +4085,147 @@ class TestParserChoices(CustomTestCase):
             self.assertEqual(
                 server_args_module._tool_call_parser_choices(),
                 list(TOOL_CALL_PARSER_NAMES),
+            )
+
+
+class TestMoeCPOutputArgs(unittest.TestCase):
+    def config(self, **changes):
+        graph = CudaGraphConfig()
+        graph.prefill.backend = graph.decode.backend = Backend.DISABLED
+        fields = dict(
+            moe_cp_output_reduction="striped_reduce_scatter",
+            moe_cp_output_validation="none",
+            enable_prefill_cp=True,
+            cp_strategy="zigzag",
+            tp_size=4,
+            attn_cp_size=4,
+            ep_size=4,
+            attn_dp_size=1,
+            moe_dp_size=1,
+            dwdp_size=1,
+            nnodes=1,
+            pp_size=1,
+            device="cuda",
+            dtype="bfloat16",
+            moe_a2a_backend="none",
+            moe_runner_backend="flashinfer_cutlass",
+            disable_flashinfer_cutlass_moe_fp4_allgather=True,
+            disable_overlap_schedule=True,
+            enable_two_batch_overlap=False,
+            enable_single_batch_overlap=False,
+            chunked_prefill_size=-1,
+            disable_radix_cache=True,
+            cuda_graph_config=graph,
+            disable_custom_all_reduce=True,
+            enable_quant_communications=False,
+            enable_lora=False,
+            speculative_algorithm=None,
+            enable_eplb=False,
+            elastic_ep_backend=None,
+            enable_fused_moe_sum_all_reduce=False,
+        )
+        fields.update(changes)
+        return SimpleNamespace(**fields)
+
+    def validate(self, cfg, architecture="Qwen3MoeForCausalLM"):
+        with (
+            patch.object(moe_hook, "resolving_view", return_value=cfg),
+            patch.object(
+                moe_hook,
+                "model_config_of",
+                return_value=SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[architecture])
+                ),
+            ),
+        ):
+            moe_hook.validate_moe_cp_output_reduction(cfg)
+
+    def test_native_default_and_cli(self):
+        self.assertEqual(ExecMoe().moe_cp_output_reduction, "all_reduce")
+        self.assertEqual(ExecMoe().moe_cp_output_validation, "none")
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = ServerArgs.from_cli_args(
+            parser.parse_args(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--moe-cp-output-reduction",
+                    "striped_reduce_scatter",
+                    "--moe-cp-output-validation",
+                    "strict",
+                ]
+            )
+        )
+        self.assertEqual(args.moe_cp_output_reduction, "striped_reduce_scatter")
+        self.assertEqual(args.moe_cp_output_validation, "strict")
+
+    def test_supported_sizes_and_separate_validation_tracks(self):
+        for size in (2, 4, 8):
+            for mode, validation in (
+                ("striped_reduce_scatter", "none"),
+                ("striped_reduce_scatter", "strict"),
+                ("reduce_scatter", "strict"),
+                ("reduce_scatter", "numerical"),
+            ):
+                self.validate(
+                    self.config(
+                        tp_size=size,
+                        attn_cp_size=size,
+                        ep_size=size,
+                        moe_cp_output_reduction=mode,
+                        moe_cp_output_validation=validation,
+                    )
+                )
+
+    def test_incompatible_configurations_are_rejected(self):
+        for change in (
+            dict(attn_cp_size=2),
+            dict(tp_size=3, attn_cp_size=3, ep_size=3),
+            dict(attn_dp_size=2),
+            dict(moe_dp_size=2),
+            dict(dwdp_size=2),
+            dict(enable_prefill_cp=False),
+            dict(cp_strategy="interleave"),
+            dict(nnodes=2),
+            dict(pp_size=2),
+            dict(dtype="float16"),
+            dict(device="cpu"),
+            dict(moe_a2a_backend="deepep"),
+            dict(moe_runner_backend="marlin"),
+            dict(disable_flashinfer_cutlass_moe_fp4_allgather=False),
+            dict(disable_overlap_schedule=False),
+            dict(enable_two_batch_overlap=True),
+            dict(enable_single_batch_overlap=True),
+            dict(chunked_prefill_size=8192),
+            dict(disable_radix_cache=False),
+            dict(cuda_graph_config=CudaGraphConfig()),
+            dict(disable_custom_all_reduce=False),
+            dict(enable_quant_communications=True),
+            dict(enable_lora=True),
+            dict(speculative_algorithm="EAGLE"),
+            dict(enable_eplb=True),
+            dict(elastic_ep_backend="mooncake"),
+            dict(enable_fused_moe_sum_all_reduce=True),
+            dict(moe_cp_output_validation="numerical"),
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.validate(self.config(**change))
+        with self.assertRaisesRegex(ValueError, "Qwen3Moe"):
+            self.validate(self.config(), architecture="LlamaForCausalLM")
+
+    def test_native_mode_does_not_read_model_or_restrict_existing_features(self):
+        self.validate(
+            self.config(
+                moe_cp_output_reduction="all_reduce", enable_two_batch_overlap=True
+            )
+        )
+        with self.assertRaises(ValueError):
+            self.validate(
+                self.config(
+                    moe_cp_output_reduction="all_reduce",
+                    moe_cp_output_validation="strict",
+                )
             )
 
 

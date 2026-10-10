@@ -40,6 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_moe_cp_rank,
     is_allocation_symmetric,
     moe_cp_all_gather_into_tensor,
+    reduce_moe_cp_output,
 )
 from sglang.srt.layers.layer_boundary.adapters.attention import (
     attn_tp_gather,
@@ -412,4 +413,31 @@ def moe_cp_take_back_output(
     if get_parallel().attn_dp_size > 1:
         hidden_states = to_dp_local(_dp_scatter_step, forward_batch, hidden_states)
 
+    return hidden_states, residual
+
+
+def moe_cp_reduce_scatter_output(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    forward_batch: ForwardBatch,
+    **kwargs,
+):
+    """Complete a MoE partial sum directly onto this CP owner's actual rows."""
+    rows = moe_cp_gathered_rows(forward_batch)
+    if rows is None:
+        raise ValueError("MoE CP owner reduction requires a CP-extend batch")
+    parallel = get_parallel()
+    if (
+        parallel.attn_cp_group.ranks != parallel.moe_ep_group.ranks
+        or parallel.attn_cp_rank != parallel.moe_ep_rank
+    ):
+        raise ValueError("MoE CP owner reduction requires aligned CP/EP rank order")
+    config = get_exec().moe
+    hidden_states = reduce_moe_cp_output(
+        hidden_states,
+        rows,
+        parallel.moe_ep_group,
+        mode=config.moe_cp_output_reduction,
+        validation=config.moe_cp_output_validation,
+    )
     return hidden_states, residual

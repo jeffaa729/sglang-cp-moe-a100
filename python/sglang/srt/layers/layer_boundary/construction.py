@@ -290,7 +290,11 @@ def _bind_stage(declaration, norm, incoming, outgoing, **options):
                 and not declaration.update.is_plain_add
                 else _attn_input_default
             )
-        moves = _cp_moves() if variant is BatchVariant.CONTEXT_PARALLEL else None
+        moves = (
+            _cp_moves(sparse=declaration.sparse)
+            if variant is BatchVariant.CONTEXT_PARALLEL
+            else None
+        )
         variants[variant] = VariantEdges(
             edge, outgoing.exits[variant], attn_input_adapter, moves
         )

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 from enum import IntEnum, auto
 from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
+import torch.distributed as dist
 import triton
 import triton.language as tl
 
@@ -1162,6 +1164,213 @@ def is_enable_moe_cp_allgather() -> bool:
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().moe_dp_group.all_gather_into_tensor(output, input)
+
+
+class _StripedMoECPOutputReducer:
+    """Calibrated BF16 output stripes, with native AR fallback.
+
+    The 2 MiB stripe is a measured layout hint, not an NCCL guarantee.
+    Random calibration checks each layout; strict mode separately checks actual
+    expert partials. Only eager, nonoverlapped execution is supported.
+    """
+
+    def __init__(self, group):
+        self.group = group
+        self.rank = group.rank_in_group
+        self.n = group.world_size
+        self.block_bytes = 2 * 1024 * 1024
+        self.layouts = {}
+        self.active = {}
+
+    def _layout(self, partial):
+        block = self.block_bytes // partial.element_size()
+        blocks = partial.numel() // block
+        if (
+            partial.dtype != torch.bfloat16
+            or blocks == 0
+            or partial.numel() % block
+            or blocks % self.n
+        ):
+            return None
+        per_owner = blocks // self.n
+        send = [
+            sum((g * self.n + self.rank) // per_owner == dest for g in range(per_owner))
+            for dest in range(self.n)
+        ]
+        received = [
+            g * self.n + source
+            for source in range(self.n)
+            for g in range(per_owner)
+            if (g * self.n + source) // per_owner == self.rank
+        ]
+        recv = [
+            sum(
+                (g * self.n + source) // per_owner == self.rank
+                for g in range(per_owner)
+            )
+            for source in range(self.n)
+        ]
+        indices = torch.tensor(
+            [b % per_owner for b in received], dtype=torch.long, device=partial.device
+        )
+        return block, [c * block for c in send], [c * block for c in recv], indices
+
+    def _striped(self, partial, layout):
+        block, send, recv, indices = layout
+        packed = (
+            partial.reshape(-1, self.n, block).permute(1, 0, 2).contiguous().flatten()
+        )
+        reduced = partial.new_empty(partial.numel() // self.n)
+        self.group.reduce_scatter_tensor(reduced, packed)
+        received = torch.empty_like(reduced)
+        dist.all_to_all_single(
+            received,
+            reduced,
+            output_split_sizes=recv,
+            input_split_sizes=send,
+            group=self.group.device_group,
+        )
+        output = torch.empty_like(reduced).view(-1, block)
+        output.index_copy_(0, indices, received.view(-1, block))
+        return output.view(partial.shape[0] // self.n, *partial.shape[1:])
+
+    def __call__(self, partial):
+        assert partial.shape[0] % self.n == 0
+        key = (tuple(partial.shape), partial.dtype, partial.device)
+        if key not in self.layouts:
+            layout = self._layout(partial)
+            active = False
+            if layout is not None:
+                gen = torch.Generator(device=partial.device).manual_seed(
+                    712 + self.rank
+                )
+                sample = torch.randn(
+                    partial.shape,
+                    dtype=torch.float32,
+                    device=partial.device,
+                    generator=gen,
+                ).to(partial.dtype)
+                native = self.group.all_reduce(sample.clone()).chunk(self.n)[self.rank]
+                proposed = self._striped(sample, layout)
+                failed = torch.tensor(
+                    int(not torch.equal(native, proposed)),
+                    dtype=torch.int32,
+                    device=partial.device,
+                )
+                dist.all_reduce(
+                    failed, op=dist.ReduceOp.MAX, group=self.group.device_group
+                )
+                active = failed.item() == 0
+            self.layouts[key] = layout
+            self.active[key] = active
+            payload = partial.numel() * partial.element_size()
+            peer_send = (
+                (sum(layout[1]) - layout[1][self.rank]) * partial.element_size()
+                if layout is not None
+                else None
+            )
+            print(
+                "CP_OWNER_REDUCTION "
+                + json.dumps(
+                    dict(
+                        rank=self.rank,
+                        shape=list(partial.shape),
+                        striped_active=active,
+                        block_bytes=self.block_bytes,
+                        native_ring_send_bytes=2 * (self.n - 1) * payload // self.n,
+                        rs_ring_send_bytes=(
+                            (self.n - 1) * payload // self.n if active else None
+                        ),
+                        owner_exchange_peer_send_bytes=peer_send if active else None,
+                        fallback=None if active else "native_ar_layout_not_verified",
+                    )
+                ),
+                flush=True,
+            )
+        if self.active[key]:
+            return self._striped(partial, self.layouts[key])
+        # Preserve expert partials for the surrounding strict/numerical checks.
+        return (
+            self.group.all_reduce(partial.clone()).chunk(self.n)[self.rank].contiguous()
+        )
+
+
+@functools.lru_cache(maxsize=8)
+def _striped_reducer(group):
+    # Reuse only immutable shape layouts/calibration; no in-flight batch state.
+    return _StripedMoECPOutputReducer(group)
+
+
+def reduce_moe_cp_output(partial, rows, group, *, mode, validation="none"):
+    """Complete an EP partial sum and remove this owner's padding.
+
+    The caller selects this operation before compute skips its all-reduce.
+    Routing, expert computation and the input all-gather are unchanged.
+    """
+    if mode not in ("reduce_scatter", "striped_reduce_scatter"):
+        raise ValueError(f"Unknown CP output reduction: {mode}")
+    if validation not in ("none", "strict", "numerical"):
+        raise ValueError(f"Unknown CP output validation: {validation}")
+    if validation == "numerical" and mode != "reduce_scatter":
+        raise ValueError("Numerical validation requires reduce_scatter")
+    if (
+        len(rows) != group.world_size
+        or any(row < 0 for row in rows)
+        or partial.shape[0] != max(rows) * group.world_size
+    ):
+        raise ValueError("CP output must contain one equally padded chunk per owner")
+    rank = group.rank_in_group
+    if mode == "striped_reduce_scatter":
+        local = _striped_reducer(group)(partial)
+    elif partial.numel() == 0:
+        local = partial[:0]
+    else:
+        local = partial.new_empty((max(rows), *partial.shape[1:]))
+        group.reduce_scatter_tensor(local, partial)
+    output = local[: rows[rank]].contiguous()
+    if validation != "none":
+        native = group.all_reduce(partial.clone()).chunk(group.world_size)[rank]
+        native = native[: rows[rank]]
+        difference = output.float() - native.float()
+        relative_l2 = (
+            difference.norm() / native.float().norm().clamp_min(1e-12)
+        ).item()
+        exact = torch.equal(output, native)
+        valid = bool(torch.isfinite(output).all() and torch.isfinite(native).all())
+        record = dict(
+            rank=rank,
+            mode=mode,
+            validation=validation,
+            rows=list(rows),
+            exact=exact,
+            relative_l2=relative_l2,
+        )
+        if validation == "strict":
+            valid = valid and exact
+        else:
+            oracle = group.all_reduce(partial.float()).chunk(group.world_size)[rank]
+            oracle = oracle[: rows[rank]]
+            scale = oracle.norm().clamp_min(1e-12)
+            baseline_error = ((native.float() - oracle).norm() / scale).item()
+            candidate_error = ((output.float() - oracle).norm() / scale).item()
+            record.update(
+                baseline_relative_l2=baseline_error,
+                candidate_relative_l2=candidate_error,
+            )
+            valid = (
+                valid
+                and bool(torch.isfinite(oracle).all())
+                and relative_l2 <= 0.01
+                and baseline_error <= 0.01
+                and candidate_error <= 0.01
+            )
+        # Every rank raises together, rather than stranding peers in a collective.
+        failed = torch.tensor(int(not valid), dtype=torch.int32, device=partial.device)
+        dist.all_reduce(failed, op=dist.ReduceOp.MAX, group=group.device_group)
+        print("CP_MOE_OUTPUT_CHECK " + json.dumps(record), flush=True)
+        if failed.item():
+            raise RuntimeError(f"CP output {validation} validation failed: {record}")
+    return output
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import os
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -18,6 +19,10 @@ from sglang.kernels.ops.communication import (
 from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+)
+from sglang.srt.layers.dp_attention import (
+    _StripedMoECPOutputReducer,
+    reduce_moe_cp_output,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -300,6 +305,86 @@ def test_attention_residual_direct_all_gather():
     torch.cuda.synchronize()
     torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
     assert handle is not None
+
+
+@pytest.mark.parametrize("mode", ["reduce_scatter", "striped_reduce_scatter"])
+@pytest.mark.parametrize(
+    "row_case", ["equal", "uneven", "empty-owner", "single-owner", "empty", "model"]
+)
+@torch.inference_mode()
+def test_moe_cp_owner_reduction(mode, row_case):
+    """NCCL-only CP ownership/parity; no SM100 multicast requirement.
+
+    Run on 2/4/8 GPUs with torchrun -m pytest on this file and
+    -k moe_cp_owner_reduction. Model shape is the 64 MiB BF16 16K x 2048 output.
+    Calibration may fall back: a passing test does not prove the fast path ran.
+    """
+    _, nccl_group = _init_world()
+    rank, size = dist.get_rank(), dist.get_world_size()
+    if size not in (2, 4, 8):
+        pytest.skip("CP owner reduction supports 2/4/8 aligned ranks")
+    rows = {
+        "equal": (9,) * size,
+        "uneven": tuple(7 + r for r in range(size)),
+        "empty-owner": (0,) + (11,) * (size - 1),
+        "single-owner": (13,) + (0,) * (size - 1),
+        "empty": (0,) * size,
+        "model": (16384 // size,) * size,
+    }[row_case]
+    width = 2048 if row_case == "model" else 32
+
+    class NCCLGroup:
+        world_size = size
+        rank_in_group = rank
+        device_group = nccl_group
+
+        def all_reduce(self, value):
+            dist.all_reduce(value, group=self.device_group)
+            return value
+
+        def reduce_scatter_tensor(self, output, value):
+            dist.reduce_scatter_tensor(output, value, group=self.device_group)
+
+    group = NCCLGroup()
+    generator = torch.Generator(device=_device()).manual_seed(712 + rank)
+    shape = (max(rows) * size, width)
+    for integer in (True, False):
+        partial = (
+            torch.randint(0, 8, shape, generator=generator, device=_device())
+            if integer
+            else torch.randn(shape, generator=generator, device=_device())
+        ).to(torch.bfloat16)
+        before = partial.clone()
+        output = reduce_moe_cp_output(
+            partial,
+            rows,
+            group,
+            mode=mode,
+            validation="strict" if mode == "striped_reduce_scatter" else "numerical",
+        )
+        oracle = group.all_reduce(partial.float()).chunk(size)[rank][: rows[rank]]
+        assert output.shape == (rows[rank], width) and output.is_contiguous()
+        assert torch.equal(partial, before)
+        if integer:
+            torch.testing.assert_close(output.float(), oracle, atol=0, rtol=0)
+
+    if mode == "striped_reduce_scatter" and row_case == "model":
+        # Rank zero alone corrupts calibration: every rank must fall back.
+        reducer = _StripedMoECPOutputReducer(group)
+        original = reducer._striped
+
+        def faulted(value, layout):
+            output = original(value, layout)
+            if rank == 0:
+                output = output.clone()
+                output[0, 0] = float("nan")
+            return output
+
+        with patch.object(reducer, "_striped", side_effect=faulted):
+            fallback = reducer(partial)
+        assert not reducer.active[(tuple(partial.shape), partial.dtype, partial.device)]
+        native = group.all_reduce(partial.clone()).chunk(size)[rank]
+        torch.testing.assert_close(fallback, native, atol=0, rtol=0)
 
 
 def _precompile(num_gpus):

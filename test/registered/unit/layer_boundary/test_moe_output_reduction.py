@@ -5,11 +5,12 @@ import contextlib
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
 import sglang
+from sglang.srt.layers import dp_attention
 from sglang.srt.layers.moe import utils as moe_utils
 from sglang.srt.layers.moe.utils import (
     post_experts_output_is_complete,
@@ -257,6 +258,159 @@ class TestModelsWithExplicitDpCompletion(CustomTestCase):
                         self.assertFalse(get_forward().mlp_reduce_scatter)
                     self.assertEqual(trace, ["RSv"] if use_rsv else ["AR", "slice"])
                     torch.testing.assert_close(output, torch.full((2, 3), 2.0))
+
+
+class TestMoeCPOutput(unittest.TestCase):
+    def group(self, size, rank):
+        return Mock(world_size=size, rank_in_group=rank, device_group=object())
+
+    def test_stripe_exchange_restores_contiguous_owner_rows(self):
+        for size in (2, 4, 8):
+            for rank in range(size):
+                with self.subTest(size=size, rank=rank):
+                    group = self.group(size, rank)
+                    reducer = dp_attention._StripedMoECPOutputReducer(group)
+                    reducer.block_bytes = 8  # Tiny layout-only CPU fixture.
+                    value = torch.arange(size * 8).to(torch.bfloat16).view(size * 2, 4)
+                    layout = reducer._layout(value)
+                    block, send, recv, _ = layout
+                    reduced = value.reshape(-1, size, block)[:, rank].flatten()
+                    group.reduce_scatter_tensor.side_effect = (
+                        lambda output, packed: output.copy_(reduced)
+                    )
+
+                    def exchange(
+                        output, input, *, output_split_sizes, input_split_sizes, group
+                    ):
+                        self.assertTrue(torch.equal(input, reduced))
+                        self.assertEqual(input_split_sizes, send)
+                        self.assertEqual(output_split_sizes, recv)
+                        per_owner = value.numel() // block // size
+                        received_blocks = [
+                            g * size + source
+                            for source in range(size)
+                            for g in range(per_owner)
+                            if (g * size + source) // per_owner == rank
+                        ]
+                        output.copy_(
+                            value.flatten().view(-1, block)[received_blocks].flatten()
+                        )
+
+                    with patch.object(
+                        dp_attention.dist, "all_to_all_single", side_effect=exchange
+                    ):
+                        output = reducer._striped(value, layout)
+                    torch.testing.assert_close(
+                        output, value.chunk(size)[rank], rtol=0, atol=0
+                    )
+                    packed = group.reduce_scatter_tensor.call_args.args[1]
+                    torch.testing.assert_close(
+                        packed,
+                        value.reshape(-1, size, block)
+                        .permute(1, 0, 2)
+                        .contiguous()
+                        .flatten(),
+                        rtol=0,
+                        atol=0,
+                    )
+
+    def test_unsupported_layout_falls_back_without_modifying_partials(self):
+        for size in (2, 4, 8):
+            group = self.group(size, 0)
+            group.all_reduce.side_effect = lambda x: x * size
+            reducer = dp_attention._StripedMoECPOutputReducer(group)
+            for dtype in (torch.float32, torch.bfloat16):
+                value = torch.ones(size * 3, 4, dtype=dtype)
+                before = value.clone()
+                output = reducer(value)
+                torch.testing.assert_close(output, before.chunk(size)[0] * size)
+                torch.testing.assert_close(value, before)
+            group.reduce_scatter_tensor.assert_not_called()
+
+    def test_peer_calibration_failure_rejects_local_matching_layout(self):
+        group = self.group(4, 1)
+        group.all_reduce.side_effect = lambda x: x * 4
+        reducer = dp_attention._StripedMoECPOutputReducer(group)
+        reducer.block_bytes = 8
+        value = torch.ones(16, 4, dtype=torch.bfloat16)
+        with (
+            patch.object(
+                reducer, "_striped", side_effect=lambda x, layout: x.chunk(4)[1] * 4
+            ),
+            patch.object(
+                dp_attention.dist,
+                "all_reduce",
+                side_effect=lambda failed, **kw: failed.fill_(1),
+            ),
+        ):
+            output = reducer(value)
+        self.assertFalse(next(iter(reducer.active.values())))
+        torch.testing.assert_close(output, value.chunk(4)[1] * 4)
+
+    def test_reduce_scatter_trims_uneven_and_empty_owner_rows(self):
+        for size in (2, 4, 8):
+            for rows in ([0] * size, list(range(size)), [3] * size):
+                for rank in range(size):
+                    group = self.group(size, rank)
+                    value = torch.ones(max(rows) * size, 4, dtype=torch.bfloat16)
+                    group.reduce_scatter_tensor.side_effect = (
+                        lambda output, partial: output.fill_(size)
+                    )
+                    output = dp_attention.reduce_moe_cp_output(
+                        value, rows, group, mode="reduce_scatter"
+                    )
+                    self.assertEqual(output.shape, (rows[rank], 4))
+                    self.assertTrue(output.is_contiguous())
+                    torch.testing.assert_close(output, torch.full_like(output, size))
+
+    def test_numerical_track_checks_actual_partials_against_fp32_oracle(self):
+        group = self.group(2, 0)
+        group.all_reduce.side_effect = lambda value: value * 2
+        value = torch.ones(6, 4, dtype=torch.bfloat16)
+        with patch.object(dp_attention.dist, "all_reduce"):
+            group.reduce_scatter_tensor.side_effect = (
+                lambda output, partial: output.fill_(2.015625)
+            )
+            output = dp_attention.reduce_moe_cp_output(
+                value, [2, 3], group, mode="reduce_scatter", validation="numerical"
+            )
+            self.assertTrue(torch.all(output == 2.015625))
+            group.reduce_scatter_tensor.side_effect = (
+                lambda output, partial: output.fill_(2.0625)
+            )
+            with self.assertRaisesRegex(RuntimeError, "numerical validation failed"):
+                dp_attention.reduce_moe_cp_output(
+                    value, [2, 3], group, mode="reduce_scatter", validation="numerical"
+                )
+
+    def test_strict_checks_actual_partials_and_propagates_peer_failure(self):
+        group = self.group(2, 0)
+        group.all_reduce.side_effect = lambda x: x * 2
+        group.reduce_scatter_tensor.side_effect = lambda output, partial: output.fill_(
+            2
+        )
+        value = torch.ones(6, 4, dtype=torch.bfloat16)
+        with patch.object(dp_attention.dist, "all_reduce"):
+            output = dp_attention.reduce_moe_cp_output(
+                value, [2, 3], group, mode="reduce_scatter", validation="strict"
+            )
+        torch.testing.assert_close(output, torch.full((2, 4), 2, dtype=value.dtype))
+        for corrupt_local in (False, True):
+            if corrupt_local:
+                group.reduce_scatter_tensor.side_effect = (
+                    lambda output, partial: output.fill_(3)
+                )
+            with (
+                patch.object(
+                    dp_attention.dist,
+                    "all_reduce",
+                    side_effect=lambda failed, **kw: failed.fill_(1),
+                ),
+                self.assertRaisesRegex(RuntimeError, "strict validation failed"),
+            ):
+                dp_attention.reduce_moe_cp_output(
+                    value, [2, 3], group, mode="reduce_scatter", validation="strict"
+                )
 
 
 if __name__ == "__main__":

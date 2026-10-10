@@ -707,6 +707,22 @@ class ExecMoe(msgspec.Struct):
 
     _NS_PATH = "exec.moe"
 
+    moe_cp_output_reduction: A[
+        Literal["all_reduce", "reduce_scatter", "striped_reduce_scatter"],
+        "Select Qwen3 MoE CP-prefill output reduction. all_reduce preserves "
+        "the native path. reduce_scatter and striped_reduce_scatter return "
+        "only CP-owned rows; striped mode calibrates its layout against native "
+        "all-reduce and falls back when it does not match. Requires aligned "
+        "TP=CP=EP=2/4/8, BF16, and eager execution without overlap.",
+    ] = "all_reduce"
+    moe_cp_output_validation: A[
+        Literal["none", "strict", "numerical"],
+        "Untimed CP-output checks on actual expert partials. strict requires "
+        "bitwise native all-reduce equivalence. numerical permits a 1% relative "
+        "L2 bound and checks an FP32 oracle; only for reduce_scatter. Do not "
+        "enable validation in performance benchmarks.",
+    ] = "none"
+
     # ---- derived: computed at publish from the leaves below.
     is_ep_joiner = Derived(
         fn="sglang.srt.arg_groups.model_override_base.ep_joiner_of",

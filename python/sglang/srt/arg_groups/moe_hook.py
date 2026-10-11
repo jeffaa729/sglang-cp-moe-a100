@@ -110,9 +110,18 @@ def validate_moe_cp_output_reduction(server_args: Any) -> None:
         if not supported:
             raise ValueError(f"--moe-cp-output-reduction={mode} requires {description}")
     architectures = model_config_of(server_args).hf_config.architectures or []
-    if architectures != ["Qwen3MoeForCausalLM"]:
+    if architectures not in (["Qwen3MoeForCausalLM"], ["Glm4MoeForCausalLM"]):
         raise ValueError(
-            "CP-owner output reduction is currently validated only for Qwen3MoeForCausalLM"
+            "CP-owner output reduction supports only Qwen3MoeForCausalLM and Glm4MoeForCausalLM"
+        )
+    if architectures == ["Glm4MoeForCausalLM"] and not (
+        cfg.disable_shared_experts_fusion
+        and cfg.moe_dense_tp_size == 1
+        and cfg.quantization == "compressed-tensors"
+    ):
+        raise ValueError(
+            "GLM CP-owner output reduction requires disabled shared-expert fusion, "
+            "moe-dense-tp-size=1 and compressed-tensors NVFP4"
         )
 
 
@@ -127,14 +136,26 @@ def handle_moe_kernel_config(server_args: Any):
 
     view = resolved_view(server_args)
     if view.moe_runner_backend == "flashinfer_cutlass":
-        assert view.quantization in [
+        compressed_nvfp4 = False
+        if view.quantization == "compressed-tensors":
+            quant_config = (
+                getattr(
+                    model_config_of(server_args).hf_config, "quantization_config", None
+                )
+                or {}
+            )
+            # This scheme already constructs a FlashInfer CUTLASS MoE runner.
+            # Do not admit arbitrary compressed-tensors INT4/FP8 schemes here.
+            compressed_nvfp4 = (
+                quant_config.get("quant_method") == "compressed-tensors"
+                and quant_config.get("format") == "nvfp4-pack-quantized"
+            )
+        assert compressed_nvfp4 or view.quantization in [
             "modelopt_fp4",
             "modelopt_fp8",
             "modelopt_mixed",
             None,
-        ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', or bfloat16 (None)."
-        )
+        ], f"Invalid quantization '{view.quantization}'. \nFlashInfer Cutlass MOE supports only: 'modelopt_fp4', 'modelopt_fp8', 'modelopt_mixed', compressed-tensors NVFP4, or bfloat16 (None)."
         assert view.ep_size in [
             1,
             cfg.tp_size,

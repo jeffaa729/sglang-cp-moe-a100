@@ -4089,6 +4089,48 @@ class TestParserChoices(CustomTestCase):
 
 
 class TestMoeCPOutputArgs(unittest.TestCase):
+    def test_cutlass_accepts_only_nvfp4_compressed_tensors(self):
+        cfg = SimpleNamespace(
+            moe_runner_backend="flashinfer_cutlass",
+            quantization="compressed-tensors",
+            ep_size=8,
+            tp_size=8,
+        )
+        for quant_config, supported in (
+            (
+                {
+                    "quant_method": "compressed-tensors",
+                    "format": "nvfp4-pack-quantized",
+                },
+                True,
+            ),
+            ({"quant_method": "compressed-tensors", "format": "pack-quantized"}, False),
+            (
+                {"quant_method": "compressed-tensors", "format": "float-quantized"},
+                False,
+            ),
+            ({"quant_method": "modelopt", "format": "nvfp4-pack-quantized"}, False),
+            ({}, False),
+        ):
+            with (
+                self.subTest(quant_config=quant_config),
+                patch.object(moe_hook, "resolving_view", return_value=cfg),
+                patch.object(moe_hook, "resolved_view", return_value=cfg),
+                patch.object(moe_hook, "run_post_process_pass"),
+                patch.object(
+                    moe_hook,
+                    "model_config_of",
+                    return_value=SimpleNamespace(
+                        hf_config=SimpleNamespace(quantization_config=quant_config)
+                    ),
+                ),
+            ):
+                if supported:
+                    moe_hook.handle_moe_kernel_config(cfg)
+                else:
+                    with self.assertRaisesRegex(AssertionError, "Invalid quantization"):
+                        moe_hook.handle_moe_kernel_config(cfg)
+
     def config(self, **changes):
         graph = CudaGraphConfig()
         graph.prefill.backend = graph.decode.backend = Backend.DISABLED
@@ -4123,6 +4165,9 @@ class TestMoeCPOutputArgs(unittest.TestCase):
             enable_eplb=False,
             elastic_ep_backend=None,
             enable_fused_moe_sum_all_reduce=False,
+            disable_shared_experts_fusion=False,
+            moe_dense_tp_size=None,
+            quantization="modelopt_fp4",
         )
         fields.update(changes)
         return SimpleNamespace(**fields)
@@ -4176,6 +4221,24 @@ class TestMoeCPOutputArgs(unittest.TestCase):
                         moe_cp_output_reduction=mode,
                         moe_cp_output_validation=validation,
                     )
+                )
+
+    def test_glm_requires_unfused_shared_experts_and_unsharded_dense_ffn(self):
+        settings = dict(
+            disable_shared_experts_fusion=True,
+            moe_dense_tp_size=1,
+            quantization="compressed-tensors",
+        )
+        self.validate(self.config(**settings), architecture="Glm4MoeForCausalLM")
+        for change in (
+            dict(disable_shared_experts_fusion=False),
+            dict(moe_dense_tp_size=8),
+            dict(quantization="modelopt_fp4"),
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "GLM"):
+                self.validate(
+                    self.config(**(settings | change)),
+                    architecture="Glm4MoeForCausalLM",
                 )
 
     def test_incompatible_configurations_are_rejected(self):

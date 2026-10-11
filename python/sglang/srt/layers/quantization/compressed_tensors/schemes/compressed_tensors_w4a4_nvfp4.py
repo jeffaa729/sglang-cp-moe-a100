@@ -21,6 +21,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     enable_flashinfer_fp4_gemm,
     fp4_gemm,
     fp4_quantize,
+    pad_nvfp4_activation_for_cutlass,
+    pad_nvfp4_weight,
+    slice_nvfp4_output,
 )
 from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
@@ -120,11 +123,14 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.weight_scale = Parameter(weight_scale, requires_grad=False)
             layer.weight_packed = Parameter(weight, requires_grad=False)
         else:
+            # Match ModelOpt's CUTLASS/cuDNN alignment handling. In particular,
+            # GLM shared-expert TP shards can have K=176, not a multiple of 32.
+            weight, layer.weights_padding_cols = pad_nvfp4_weight(
+                layer.weight_packed.data
+            )
             swizzled_weight_scale = swizzle_blockscale(layer.weight_scale)
             layer.weight_scale = Parameter(swizzled_weight_scale, requires_grad=False)
-            layer.weight_packed = Parameter(
-                layer.weight_packed.data, requires_grad=False
-            )
+            layer.weight_packed = Parameter(weight, requires_grad=False)
 
         layer.alpha = Parameter(
             1 / (layer.input_global_scale * layer.weight_global_scale),
@@ -139,10 +145,14 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
     ) -> torch.Tensor:
         output_dtype = x.dtype
         w_n, _ = layer.weight_packed.shape
-        output_shape = [x.shape[0], w_n]
+        output_size = layer.output_size_per_partition
+        output_shape = [x.shape[0], output_size]
 
         # quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_blockscale = fp4_quantize(x, layer.input_global_scale)
+        x_fp4 = pad_nvfp4_activation_for_cutlass(
+            x_fp4, getattr(layer, "weights_padding_cols", 0)
+        )
 
         assert x_fp4.dtype == torch.uint8
         assert layer.weight_packed.dtype == torch.uint8
@@ -164,6 +174,7 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             output_dtype,
             w_n,
         )
+        out = slice_nvfp4_output(out, output_size)
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)

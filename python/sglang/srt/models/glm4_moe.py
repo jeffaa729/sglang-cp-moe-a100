@@ -518,13 +518,18 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     "moe_wna16",
                 }
             )
+            # Packed NVFP4 projections expose weight_packed, not weight. They
+            # use their quantization scheme rather than the INT8/FP8 fast paths.
+            shared_weight = getattr(self.shared_experts.gate_up_proj, "weight", None)
             self.shared_experts_is_int8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
+                and shared_weight is not None
+                and shared_weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+                and shared_weight is not None
+                and shared_weight.dtype == torch.float8_e4m3fn
             )
             if self.shared_experts_is_fp8:
                 if (

@@ -164,6 +164,50 @@ class TestNvFp4LinearBackends(CustomTestCase):
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
 
+    def test_compressed_tensors_cutlass_padding(self):
+        from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+            CompressedTensorsW4A4Fp4,
+        )
+
+        torch.manual_seed(7)
+        with mock.patch.object(
+            fp4_utils,
+            "FP4_GEMM_RUNNER_BACKEND",
+            Fp4GemmRunnerBackend("flashinfer_cutlass"),
+        ):
+            for m, n, k in ((5, 4096, 176), (5, 352, 4096), (5, 176, 336)):
+                with self.subTest(shape=(m, n, k)):
+                    scheme = CompressedTensorsW4A4Fp4()
+                    layer = torch.nn.Module().cuda()
+                    layer.output_size_per_partition = n
+                    weight = (
+                        torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+                    )
+                    packed, scales, global_scale, dequant = quantize_nvfp4_shard(weight)
+                    for name, value in (
+                        ("weight_packed", packed),
+                        ("weight_scale", scales),
+                        ("weight_global_scale", global_scale.reshape(1)),
+                        (
+                            "input_global_scale",
+                            torch.tensor([1.0 / ACT_SCALE], device="cuda"),
+                        ),
+                    ):
+                        layer.register_parameter(
+                            name, torch.nn.Parameter(value, requires_grad=False)
+                        )
+                    scheme.process_weights_after_loading(layer)
+                    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16) / 10
+                    out = scheme.apply_weights(layer, x)
+                    x_q, x_sf = fp4_quantize(x, layer.input_global_scale)
+                    x_dequant = dequantize_nvfp4_to_dtype(
+                        x_q, x_sf, layer.input_global_scale, torch.float32
+                    )
+                    self.assertEqual(out.shape, (m, n))
+                    assert_output_close(
+                        self, out, x_dequant @ dequant.T, rtol=5e-2, atol=5e-2
+                    )
+
     def test_flashinfer_cudnn(self):
         self._run_backend("flashinfer_cudnn")
 

@@ -19,6 +19,7 @@ from sglang.kernels.ops.communication.mp import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
 )
+from sglang.srt.layers.dp_attention import reduce_moe_cp_output
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -300,6 +301,50 @@ def test_attention_residual_direct_all_gather():
     torch.cuda.synchronize()
     torch.testing.assert_close(output, full_reference, rtol=2e-2, atol=3e-2)
     assert handle is not None
+
+
+@pytest.mark.parametrize("mode", ["reduce_scatter", "striped_reduce_scatter"])
+@torch.inference_mode()
+def test_moe_cp_owner_reduction(mode):
+    """Check actual NCCL owner reduction at the 16K x 2048 BF16 model shape.
+
+    Run on 2/4/8 GPUs with torchrun -m pytest on this file and
+    -k moe_cp_owner_reduction. Padding and failure consensus have CPU coverage.
+    Calibration may fall back: a passing test does not prove the fast path ran.
+    """
+    _, nccl_group = _init_world()
+    rank, size = dist.get_rank(), dist.get_world_size()
+    if size not in (2, 4, 8):
+        pytest.skip("CP owner reduction supports 2/4/8 aligned ranks")
+    rows = (16384 // size,) * size
+
+    class NCCLGroup:
+        world_size = size
+        rank_in_group = rank
+        device_group = nccl_group
+
+        def all_reduce(self, value):
+            dist.all_reduce(value, group=self.device_group)
+            return value
+
+        def reduce_scatter_tensor(self, output, value):
+            dist.reduce_scatter_tensor(output, value, group=self.device_group)
+
+    group = NCCLGroup()
+    generator = torch.Generator(device=_device()).manual_seed(712 + rank)
+    partial = torch.randn(
+        (16384, 2048), generator=generator, device=_device()
+    ).to(torch.bfloat16)
+    before = partial.clone()
+    output = reduce_moe_cp_output(
+        partial,
+        rows,
+        group,
+        mode=mode,
+        validation="strict" if mode == "striped_reduce_scatter" else "numerical",
+    )
+    assert output.shape == (rows[rank], 2048)
+    assert torch.equal(partial, before)
 
 
 def _precompile(num_gpus):

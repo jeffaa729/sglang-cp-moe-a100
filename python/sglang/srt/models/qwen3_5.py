@@ -49,6 +49,11 @@ from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
 )
+from sglang.srt.layers.cp.utils import (
+    cp_gather_full_sequence_states,
+    cp_shard_hidden_states,
+    is_cp_active,
+)
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1145,10 +1150,20 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
+            cp_active = is_cp_active(forward_batch)
+            if cp_active:
+                # GDN consumes a contiguous sequence and updates its final state.
+                # Reuse the full-sequence kernel on each CP rank, rather than
+                # treating disconnected zigzag blocks as independent sequences.
+                hidden_states = cp_gather_full_sequence_states(
+                    hidden_states, forward_batch
+                )
             hidden_states = self.linear_attn(
                 hidden_states,
                 forward_batch,
             )
+            if cp_active:
+                hidden_states = cp_shard_hidden_states(hidden_states, forward_batch)
 
         # Fully Connected
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)

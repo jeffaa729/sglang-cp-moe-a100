@@ -43,6 +43,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_slice_output,
     dp_cp_take_back_output,
     keep_output,
+    moe_cp_reduce_scatter_output,
     moe_cp_take_back_output,
     move_rows,
     residual_slice_output,
@@ -64,7 +65,7 @@ from sglang.srt.layers.layer_boundary.prepare import (
     _tp_sum_with_residual_read,
     _update_read,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 
 
 def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
@@ -84,16 +85,24 @@ def tbo_split_moves(layer_input_rows: Layout) -> Tuple[Callable, Callable]:
     raise NotImplementedError(f"{layer_input_rows=}")
 
 
-def _cp_moves() -> CpMoves:
+def _cp_moves(*, sparse: bool = False) -> CpMoves:
     """DSA and MLA CP gather equal shards over the attention-CP group and can
     complete a sum over it. GQA prefill CP gathers blocks padded to the longest
-    over the MoE-CP group and takes back only a complete output."""
+    over the MoE-CP group. Its opt-in MoE owner reduction completes the sum
+    without replicating the complete output; dense FFNs keep the native path."""
     if _cp_gathers_over_attn_cp():
         return CpMoves(
             gather=_then_attn_cp_gather,
             take_back=attn_cp_take_back_output,
             reduce_scatter=attn_cp_reduce_scatter_output,
             reduce_scatter_group=lambda: get_parallel().attn_cp_group,
+        )
+    if sparse and get_exec().moe.moe_cp_output_reduction != "all_reduce":
+        return CpMoves(
+            gather=_then_moe_cp_gather,
+            take_back=moe_cp_take_back_output,
+            reduce_scatter=moe_cp_reduce_scatter_output,
+            reduce_scatter_group=lambda: get_parallel().moe_ep_group,
         )
     return CpMoves(
         gather=_then_moe_cp_gather,

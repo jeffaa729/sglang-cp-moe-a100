@@ -40,6 +40,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     attn_tp_slice_output,
     dp_cp_take_back_output,
     keep_output,
+    moe_cp_reduce_scatter_output,
     moe_cp_take_back_output,
     residual_slice_output,
     update_attn_tp_gather_output,
@@ -103,6 +104,7 @@ def planning(
     a2a=False,
     dsa_cp=False,
     boundary_reduction="rs+rsv",
+    moe_cp_output_reduction="all_reduce",
 ):
     """What layer planning and communicator construction read, without the
     process-wide parallel state. ``parallel`` may be a callable, for a
@@ -141,6 +143,10 @@ def planning(
             "get_exec",
             lambda: SimpleNamespace(
                 comm=SimpleNamespace(boundary_reduction=boundary_reduction),
+                moe=SimpleNamespace(
+                    moe_cp_output_reduction=moe_cp_output_reduction,
+                    moe_cp_output_validation="none",
+                ),
                 overlap=SimpleNamespace(enable_two_batch_overlap=False),
             ),
         ),
@@ -198,6 +204,7 @@ def build(
         a2a=a2a,
         dsa_cp=dsa_cp,
         boundary_reduction=kwargs.pop("boundary_reduction", "rs+rsv"),
+        moe_cp_output_reduction=kwargs.pop("moe_cp_output_reduction", "all_reduce"),
     ):
         return make_test_stages(
             **facts,
@@ -1071,6 +1078,112 @@ class TestPrefillCP(CustomTestCase):
             moe_dense_tp_size=1,
             **overrides,
         )
+
+    def test_moe_owner_reduction_uses_native_exit_scope_only_for_cp(self):
+        for size in (2, 4, 8):
+            for mode in ("reduce_scatter", "striped_reduce_scatter"):
+                with self.subTest(size=size, mode=mode):
+                    parallel = parallel_of(
+                        attn_dp=1,
+                        attn_tp=1,
+                        attn_cp=size,
+                        enable_prefill_cp=True,
+                        moe_ep_size=size,
+                        moe_tp_size=1,
+                        moe_ep_group=SimpleNamespace(ranks=list(range(size))),
+                    )
+                    communicator = build(
+                        layer_case(1, 3, sparse=True, previous_sparse=True),
+                        parallel,
+                        boundary_reduction="ar",
+                        moe_cp_output_reduction=mode,
+                    )
+                    cp = communicator.ffn.plan.paths[BatchVariant.CONTEXT_PARALLEL]
+                    ordinary = communicator.ffn.plan.paths[BatchVariant.ORDINARY]
+                    self.assertIs(cp.output_move, moe_cp_reduce_scatter_output)
+                    self.assertTrue(cp.output_move_completes_sum)
+                    self.assertTrue(cp.output.may_reduce_scatter)
+                    self.assertFalse(cp.output.may_defer_to_next)
+                    self.assertIs(cp.complete_output_move, moe_cp_take_back_output)
+                    self.assertIs(ordinary.output_move, keep_output)
+                    self.assertFalse(ordinary.output.may_reduce_scatter)
+                    # The same decision tells compute to skip its all-reduce and
+                    # chooses the matching owner completion; no extra sum is owed.
+                    self.assertTrue(
+                        communicator.ffn.plan.output._skips_sum_for_reduce_scatter(
+                            cp, None
+                        )
+                    )
+                    self.assertIsNone(
+                        communicator.ffn.plan.output._sum_owed_after_skip(cp, True)
+                    )
+                    dense = build(
+                        layer_case(1, 3),
+                        parallel,
+                        boundary_reduction="ar",
+                        moe_cp_output_reduction=mode,
+                    )
+                    dense_cp = dense.ffn.plan.paths[BatchVariant.CONTEXT_PARALLEL]
+                    self.assertIs(dense_cp.output_move, moe_cp_take_back_output)
+                    self.assertFalse(dense_cp.output.may_reduce_scatter)
+
+    def test_moe_owner_completion_reduces_once_and_keeps_residual_local(self):
+        for size in (2, 4, 8):
+            rank = size - 1
+            rows = list(range(1, size + 1))
+            group = SimpleNamespace(
+                ranks=list(range(size)),
+                world_size=size,
+                rank_in_group=rank,
+                all_reduce=MagicMock(),
+                reduce_scatter_tensor=MagicMock(),
+            )
+            group.reduce_scatter_tensor.side_effect = (
+                lambda output, value: output.copy_(value.chunk(size)[rank] * size)
+            )
+            parallel = parallel_of(
+                attn_dp=1,
+                attn_tp=1,
+                attn_cp=size,
+                attn_cp_rank=rank,
+                enable_prefill_cp=True,
+                moe_ep_size=size,
+                moe_ep_rank=rank,
+                moe_tp_size=1,
+                moe_ep_group=group,
+            )
+            communicator = build(
+                layer_case(1, 3, sparse=True, previous_sparse=True),
+                parallel,
+                boundary_reduction="ar",
+                moe_cp_output_reduction="reduce_scatter",
+            )
+            residual = torch.zeros(rows[rank], 4, dtype=torch.bfloat16)
+            stream = ResidualStream(residual)
+            fb = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                attn_cp_metadata=SimpleNamespace(per_rank_actual_token=rows),
+                residual_stream=stream,
+            )
+            partial = torch.arange(max(rows) * size * 4).to(torch.bfloat16).view(-1, 4)
+            with (
+                planning(
+                    parallel,
+                    boundary_reduction="ar",
+                    moe_cp_output_reduction="reduce_scatter",
+                ),
+                patch.object(moe_utils, "get_parallel", return_value=parallel),
+            ):
+                with communicator.ffn.exit(fb) as scope:
+                    self.assertTrue(comm_exit.get_forward().mlp_reduce_scatter)
+                    produced = moe_utils.post_experts_all_reduce(partial)
+                    self.assertIs(produced, partial)
+                output = scope.finish(produced)
+            group.all_reduce.assert_not_called()
+            group.reduce_scatter_tensor.assert_called_once()
+            torch.testing.assert_close(output, partial.chunk(size)[rank] * size)
+            self.assertIs(stream.residual, residual)
+            self.assertIsNone(stream.pending.owed)
 
     def test_a_dsa_cp_extend_leaves_its_sum_to_the_reduce_scatter(self):
         # A MoE on the TP group, as under DSA interleave CP without a2a.

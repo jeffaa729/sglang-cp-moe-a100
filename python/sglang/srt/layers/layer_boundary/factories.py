@@ -40,6 +40,7 @@ from sglang.srt.layers.layer_boundary.layout import (
     moe_gathers_over_moe_cp,
     token_axis_sizes,
 )
+from sglang.srt.layers.layer_boundary.ops import moe_cp_reduce_scatter_output
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
@@ -142,7 +143,19 @@ def _resolve_ffn(
             residual,
             returned,
         )
-    if cp_shards and _cp_moves().reduce_scatter is not None:
+    cp_moves = (
+        _cp_moves(sparse=sparse and variant is BatchVariant.CONTEXT_PARALLEL)
+        if cp_shards
+        else None
+    )
+    if (
+        cp_moves is not None
+        and cp_moves.reduce_scatter is moe_cp_reduce_scatter_output
+        and can_move_output
+    ):
+        # The MoE-specific opt-in is independent of the other FFN boundaries.
+        use_reduce_scatter = True
+    if cp_shards and cp_moves.reduce_scatter is not None:
         may_leave = variant is not BatchVariant.CONTEXT_PARALLEL
         may_scatter = True
     elif cp_shards or parallel.attn_dp_size > 1:
